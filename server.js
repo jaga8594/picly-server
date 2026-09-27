@@ -30,7 +30,7 @@ app.post('/api/trim', upload.single('video'), (req, res) => {
   if (duration <= 0) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Invalid range' }); }
 
   const output = `outputs/trim-${Date.now()}.mp4`;
-  console.log(`Trim: ${start}s → ${end}s`);
+  console.log(`Trim: ${start}s → ${end}s (${duration}s)`);
 
   ffmpeg(req.file.path)
     .setStartTime(start)
@@ -39,8 +39,8 @@ app.post('/api/trim', upload.single('video'), (req, res) => {
     .audioCodec('aac')
     .outputOptions([
       '-vf', 'scale=720:-2',
-      '-preset', 'medium',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '26',
       '-maxrate', '2.5M',
       '-bufsize', '5M',
       '-profile:v', 'high',
@@ -68,9 +68,9 @@ app.post('/api/compress', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const quality = req.body.quality || 'medium';
   const presets = {
-    high:   { crf: '20', preset: 'slow',   maxrate: '3M' },
-    medium: { crf: '23', preset: 'medium', maxrate: '2.5M' },
-    low:    { crf: '28', preset: 'fast',   maxrate: '1.5M' }
+    high:   { crf: '23', preset: 'fast',      maxrate: '3M' },
+    medium: { crf: '26', preset: 'ultrafast', maxrate: '2.5M' },
+    low:    { crf: '30', preset: 'ultrafast', maxrate: '1.5M' }
   };
   const p = presets[quality] || presets.medium;
   const output = `outputs/comp-${Date.now()}.mp4`;
@@ -113,7 +113,7 @@ app.post('/api/mp3', upload.single('video'), (req, res) => {
   ffmpeg(req.file.path)
     .noVideo()
     .audioCodec('libmp3lame')
-    .audioQuality(2)
+    .audioQuality(4)
     .outputOptions(['-threads', '0'])
     .save(output)
     .on('end', () => {
@@ -134,7 +134,7 @@ app.post('/api/gif', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const start = parseFloat(req.body.start) || 0;
   const duration = parseFloat(req.body.duration) || 3;
-  const fps = req.body.fps || '15';
+  const fps = req.body.fps || '12';
   const output = `outputs/gif-${Date.now()}.gif`;
   console.log(`GIF: ${start}s, ${duration}s, ${fps}fps`);
 
@@ -142,7 +142,7 @@ app.post('/api/gif', upload.single('video'), (req, res) => {
     .setStartTime(start)
     .setDuration(duration)
     .outputOptions([
-      '-vf', `fps=${fps},scale=480:-1:flags=lanczos`,
+      '-vf', `fps=${fps},scale=480:-1:flags=fast_bilinear`,
       '-threads', '0'
     ])
     .save(output)
