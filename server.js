@@ -22,6 +22,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'picly-ffmpeg', time: new Date().toISOString() });
 });
 
+// ==================== TRIM ====================
 app.post('/api/trim', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const start = parseFloat(req.body.start) || 0;
@@ -64,6 +65,7 @@ app.post('/api/trim', upload.single('video'), (req, res) => {
     });
 });
 
+// ==================== COMPRESS ====================
 app.post('/api/compress', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const quality = req.body.quality || 'medium';
@@ -105,6 +107,7 @@ app.post('/api/compress', upload.single('video'), (req, res) => {
     });
 });
 
+// ==================== MP3 ====================
 app.post('/api/mp3', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const output = `outputs/audio-${Date.now()}.mp3`;
@@ -130,6 +133,7 @@ app.post('/api/mp3', upload.single('video'), (req, res) => {
     });
 });
 
+// ==================== GIF ====================
 app.post('/api/gif', upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video' });
   const start = parseFloat(req.body.start) || 0;
@@ -150,6 +154,52 @@ app.post('/api/gif', upload.single('video'), (req, res) => {
       console.log('✅ GIF done:', output);
       fs.unlinkSync(req.file.path);
       res.download(output, 'picly.gif', () => {
+        setTimeout(() => { try { fs.unlinkSync(output); } catch(e){} }, 30000);
+      });
+    })
+    .on('error', (err) => {
+      console.error('❌ Error:', err.message);
+      try { fs.unlinkSync(req.file.path); } catch(e){}
+      res.status(500).json({ error: err.message });
+    });
+});
+
+// ==================== ENHANCE ====================
+app.post('/api/enhance', upload.single('video'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No video' });
+  
+  const type = req.body.type || 'bright';
+  const filters = {
+    bright:   'eq=brightness=0.08:contrast=1.15:saturation=1.1',
+    contrast: 'eq=contrast=1.3:saturation=1.25',
+    sharpen:  'unsharp=5:5:1.2:5:5:0.0',
+    denoise:  'hqdn3d=4:3:6:4.5'
+  };
+  const filter = filters[type] || filters.bright;
+  
+  const output = `outputs/enh-${Date.now()}.mp4`;
+  console.log(`Enhance: ${type}`);
+
+  ffmpeg(req.file.path)
+    .videoCodec('libx264')
+    .audioCodec('aac')
+    .outputOptions([
+      '-vf', filter + ',scale=720:-2',
+      '-preset', 'ultrafast',
+      '-crf', '23',
+      '-maxrate', '2.5M',
+      '-bufsize', '5M',
+      '-profile:v', 'high',
+      '-level', '4.0',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      '-threads', '0'
+    ])
+    .save(output)
+    .on('end', () => {
+      console.log('✅ Enhance done:', output);
+      fs.unlinkSync(req.file.path);
+      res.download(output, 'picly-enhanced.mp4', () => {
         setTimeout(() => { try { fs.unlinkSync(output); } catch(e){} }, 30000);
       });
     })
