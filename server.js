@@ -250,21 +250,54 @@ app.post('/api/upscale', upload.single('image'), async (req, res) => {
   } catch (err) { console.error('❌ Upscale error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
 });
 
-// CLIPDROP — CLEANUP
-app.post('/api/cleanup', upload.single('image'), async (req, res) => {
+// ==================== CLIPDROP — CLEANUP (Manual Mask) ====================
+app.post('/api/cleanup', upload.fields([
+  { name: 'image', maxCount: 1 },
+  { name: 'mask', maxCount: 1 }
+]), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No image' });
+    if (!req.files || !req.files.image || !req.files.mask) {
+      return res.status(400).json({ error: 'Image and mask required' });
+    }
     if (!CLIPDROP_KEY) return res.status(500).json({ error: 'Clipdrop key not set' });
-    const imageBuffer = fs.readFileSync(req.file.path);
+
+    const imagePath = req.files.image[0].path;
+    const maskPath = req.files.mask[0].path;
+
+    const imageBuffer = fs.readFileSync(imagePath);
+    const maskBuffer = fs.readFileSync(maskPath);
+
+    console.log(`🧹 Cleanup: image ${(imageBuffer.length / 1024).toFixed(0)} KB, mask ${(maskBuffer.length / 1024).toFixed(0)} KB`);
+
     const formData = new FormData();
     formData.append('image_file', new Blob([imageBuffer], { type: 'image/png' }), 'photo.png');
-    formData.append('mask_file', new Blob([imageBuffer], { type: 'image/png' }), 'mask.png');
-    const cdRes = await fetch('https://clipdrop-api.co/cleanup/v1', { method: 'POST', headers: { 'x-api-key': CLIPDROP_KEY }, body: formData });
-    if (!cdRes.ok) { const errText = await cdRes.text(); throw new Error(`Clipdrop ${cdRes.status}: ${errText.slice(0, 200)}`); }
+    formData.append('mask_file', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
+
+    const cdRes = await fetch('https://clipdrop-api.co/cleanup/v1', {
+      method: 'POST',
+      headers: { 'x-api-key': CLIPDROP_KEY },
+      body: formData
+    });
+
+    if (!cdRes.ok) {
+      const errText = await cdRes.text();
+      console.error('❌ Clipdrop error:', cdRes.status, errText.slice(0, 300));
+      throw new Error(`Clipdrop ${cdRes.status}: ${errText.slice(0, 200)}`);
+    }
+
     const outputBuffer = Buffer.from(await cdRes.arrayBuffer());
-    try { fs.unlinkSync(req.file.path); } catch(e){}
-    res.set('Content-Type', 'image/jpeg'); res.send(outputBuffer);
-  } catch (err) { console.error('❌ Cleanup error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
+
+    try { fs.unlinkSync(imagePath); } catch(e){}
+    try { fs.unlinkSync(maskPath); } catch(e){}
+
+    res.set('Content-Type', 'image/jpeg');
+    res.send(outputBuffer);
+  } catch (err) {
+    console.error('❌ Cleanup error:', err.message);
+    try { if (req.files?.image?.[0]?.path) fs.unlinkSync(req.files.image[0].path); } catch(e){}
+    try { if (req.files?.mask?.[0]?.path) fs.unlinkSync(req.files.mask[0].path); } catch(e){}
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ==================== CODEFORMER — ASYNC RESTORE ====================
@@ -329,7 +362,7 @@ async function processRestore(jobId, filePath) {
         const pollText = await pollRes.text();
         console.log(`🔍 [${jobId}] Poll ${i + 1}:`, pollText.slice(0, 300));
 
-        // ✅ FIX: 'event: complete' check karo (na ki 'process_completed')
+        // ✅ FIX: 'event: complete' check karo
         if (pollText.includes('event: complete') || pollText.includes('process_completed')) {
           for (const line of pollText.split('\n')) {
             if (line.startsWith('data:')) {
@@ -505,4 +538,5 @@ app.listen(PORT, () => {
   console.log(`HF: ${HF_TOKEN ? '✅' : '❌'}`);
   console.log(`sharp: ✅`);
   console.log(`Async restore: ✅ (event: complete fix)`);
+  console.log(`Manual cleanup: ✅ (mask support)`);
 });
