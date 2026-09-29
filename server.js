@@ -32,8 +32,30 @@ const upload = multer({ dest: 'uploads/', limits: { fileSize: 50 * 1024 * 1024 }
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 if (!fs.existsSync('outputs')) fs.mkdirSync('outputs');
 
+// ==================== JOB STORE (in-memory) ====================
+const jobs = new Map();
+
+function createJob() {
+  const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+  jobs.set(jobId, {
+    status: 'processing',
+    resultBuffer: null,
+    error: null,
+    createdAt: Date.now()
+  });
+  // Auto-cleanup: 10 min baad job delete
+  setTimeout(() => {
+    const job = jobs.get(jobId);
+    if (job && job.resultBuffer) {
+      jobs.delete(jobId);
+      console.log('🧹 Job cleanup:', jobId);
+    }
+  }, 10 * 60 * 1000);
+  return jobId;
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', imgly: !!removeBackground, cf: !!CF_ACCOUNT_ID && !!CF_API_TOKEN, clipdrop: !!CLIPDROP_KEY, hf: !!HF_TOKEN });
+  res.json({ status: 'ok', imgly: !!removeBackground, cf: !!CF_ACCOUNT_ID && !!CF_API_TOKEN, clipdrop: !!CLIPDROP_KEY, hf: !!HF_TOKEN, jobs: jobs.size });
 });
 
 function getDimensions(ratio) {
@@ -245,23 +267,25 @@ app.post('/api/cleanup', upload.single('image'), async (req, res) => {
   } catch (err) { console.error('❌ Cleanup error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
 });
 
-// CODEFORMER — RESTORE (384px FAST)
-app.post('/api/restore', upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No image' });
+// ==================== CODEFORMER — ASYNC RESTORE ====================
+async function processRestore(jobId, filePath) {
+  const job = jobs.get(jobId);
+  if (!job) return;
 
-    console.log('🎨 Restoring with CodeFormer (384px, fast)...');
+  try {
+    console.log(`🎨 [${jobId}] Restoring with CodeFormer (384px)...`);
 
     const smallPath = `uploads/restore-small-${Date.now()}.jpg`;
-    await sharp(req.file.path)
+    await sharp(filePath)
       .resize(384, 384, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 70 })
       .toFile(smallPath);
 
     const imageBuffer = fs.readFileSync(smallPath);
     const base64Image = 'data:image/jpeg;base64,' + imageBuffer.toString('base64');
-    console.log('Uploaded:', (imageBuffer.length / 1024).toFixed(0), 'KB');
+    console.log(`📤 [${jobId}] Uploaded:`, (imageBuffer.length / 1024).toFixed(0), 'KB');
 
+    // Step 1: POST
     const postController = new AbortController();
     const postTimeout = setTimeout(() => postController.abort(), 20000);
     const postRes = await fetch('https://sczhou-codeformer.hf.space/gradio_api/call/inference', {
@@ -285,8 +309,9 @@ app.post('/api/restore', upload.single('image'), async (req, res) => {
     const postData = await postRes.json();
     const eventId = postData.event_id;
     if (!eventId) throw new Error('No event_id');
-    console.log('Event ID:', eventId);
+    console.log(`🆔 [${jobId}] Event ID:`, eventId);
 
+    // Step 2: Poll (max 30 × 1.5 sec = 45 sec)
     let resultUrl = null;
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 1500));
@@ -329,6 +354,7 @@ app.post('/api/restore', upload.single('image'), async (req, res) => {
 
     if (!resultUrl) throw new Error('CodeFormer timeout');
 
+    // Step 3: Download
     const imgController = new AbortController();
     const imgTimeout = setTimeout(() => imgController.abort(), 20000);
     const imgRes = await fetch(resultUrl, { signal: imgController.signal });
@@ -336,17 +362,51 @@ app.post('/api/restore', upload.single('image'), async (req, res) => {
 
     const outputBuffer = Buffer.from(await imgRes.arrayBuffer());
 
-    try { fs.unlinkSync(req.file.path); } catch(e){}
+    try { fs.unlinkSync(filePath); } catch(e){}
     try { fs.unlinkSync(smallPath); } catch(e){}
 
-    res.set('Content-Type', 'image/png');
-    res.send(outputBuffer);
-    console.log('✅ Restored:', (outputBuffer.length / 1024).toFixed(0), 'KB');
+    // Update job
+    job.status = 'completed';
+    job.resultBuffer = outputBuffer;
+    console.log(`✅ [${jobId}] Restored:`, (outputBuffer.length / 1024).toFixed(0), 'KB');
   } catch (err) {
-    console.error('❌ Restore error:', err.message);
-    try { fs.unlinkSync(req.file.path); } catch(e){}
+    console.error(`❌ [${jobId}] Restore error:`, err.message);
+    job.status = 'failed';
+    job.error = err.message;
+    try { fs.unlinkSync(filePath); } catch(e){}
+  }
+}
+
+app.post('/api/restore', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image' });
+
+    const jobId = createJob();
+    console.log(`🎯 New job: ${jobId}`);
+
+    // Start background process (no await)
+    processRestore(jobId, req.file.path);
+
+    // Immediately respond with job ID
+    res.json({ jobId, status: 'processing' });
+  } catch (err) {
+    console.error('❌ Restore start error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/restore-status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({ status: job.status, error: job.error });
+});
+
+app.get('/api/restore-result/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'completed') return res.status(400).json({ error: 'Job not completed', status: job.status });
+  res.set('Content-Type', 'image/png');
+  res.send(job.resultBuffer);
 });
 
 // BG REMOVE
@@ -411,4 +471,5 @@ app.listen(PORT, () => {
   console.log(`Clipdrop: ${CLIPDROP_KEY ? '✅' : '❌'}`);
   console.log(`HF: ${HF_TOKEN ? '✅' : '❌'}`);
   console.log(`sharp: ✅`);
+  console.log(`Async restore: ✅`);
 });
