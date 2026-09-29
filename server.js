@@ -32,7 +32,7 @@ const upload = multer({ dest: 'uploads/', limits: { fileSize: 50 * 1024 * 1024 }
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 if (!fs.existsSync('outputs')) fs.mkdirSync('outputs');
 
-// ==================== JOB STORE (in-memory) ====================
+// ==================== JOB STORE ====================
 const jobs = new Map();
 
 function createJob() {
@@ -222,7 +222,7 @@ app.post('/api/ai-editor', upload.single('image'), async (req, res) => {
   } catch (err) { console.error('❌ AI Editor error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
 });
 
-// CLIPDROP — UPSCALE (2x/4x)
+// CLIPDROP — UPSCALE
 app.post('/api/upscale', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image' });
@@ -287,7 +287,7 @@ async function processRestore(jobId, filePath) {
 
     // Step 1: POST
     const postController = new AbortController();
-    const postTimeout = setTimeout(() => postController.abort(), 20000);
+    const postTimeout = setTimeout(() => postController.abort(), 30000);
     const postRes = await fetch('https://sczhou-codeformer.hf.space/gradio_api/call/inference', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -327,51 +327,35 @@ async function processRestore(jobId, filePath) {
         clearTimeout(pollTimeout);
 
         const pollText = await pollRes.text();
-        console.log(`🔍 [${jobId}] Poll ${i + 1} response:`, pollText.slice(0, 400));
+        console.log(`🔍 [${jobId}] Poll ${i + 1}:`, pollText.slice(0, 300));
 
-        // Check for completed
-        if (pollText.includes('process_completed')) {
+        // ✅ FIX: 'event: complete' check karo (na ki 'process_completed')
+        if (pollText.includes('event: complete') || pollText.includes('process_completed')) {
           for (const line of pollText.split('\n')) {
             if (line.startsWith('data:')) {
               try {
                 const jsonStr = line.replace('data:', '').trim();
                 const data = JSON.parse(jsonStr);
                 
-                // Try multiple formats (Gradio v4 variations)
                 let url = null;
                 
-                // Format 1: Array directly
+                // Format: [{url: "...", path: "..."}]
                 if (Array.isArray(data) && data[0]) {
-                  if (typeof data[0] === 'string') url = data[0];
-                  else if (data[0].url) url = data[0].url;
-                  else if (data[0].path) url = data[0].path;
+                  const first = data[0];
+                  if (typeof first === 'string') url = first;
+                  else if (first.url) url = first.url;
+                  else if (first.path) url = first.path;
                 }
-                // Format 2: { data: [...] }
+                // Format: { data: [...] }
                 else if (data && data.data && Array.isArray(data.data) && data.data[0]) {
-                  if (typeof data.data[0] === 'string') url = data.data[0];
-                  else if (data.data[0].url) url = data.data[0].url;
-                  else if (data.data[0].path) url = data.data[0].path;
-                }
-                // Format 3: { output: { data: [...] } }
-                else if (data && data.output && data.output.data) {
-                  const out = data.output.data;
-                  if (Array.isArray(out) && out[0]) {
-                    if (typeof out[0] === 'string') url = out[0];
-                    else if (out[0].url) url = out[0].url;
-                    else if (out[0].path) url = out[0].path;
-                  }
-                }
-                // Format 4: { output: [...] }
-                else if (data && data.output && Array.isArray(data.output) && data.output[0]) {
-                  if (typeof data.output[0] === 'string') url = data.output[0];
-                  else if (data.output[0].url) url = data.output[0].url;
+                  const first = data.data[0];
+                  if (typeof first === 'string') url = first;
+                  else if (first.url) url = first.url;
+                  else if (first.path) url = first.path;
                 }
                 
                 if (url) {
-                  // If relative URL, prepend HF Space URL
-                  if (url.startsWith('/')) {
-                    url = 'https://sczhou-codeformer.hf.space' + url;
-                  }
+                  if (url.startsWith('/')) url = 'https://sczhou-codeformer.hf.space' + url;
                   resultUrl = url;
                   console.log(`✅ [${jobId}] Result URL found:`, url);
                   break;
@@ -414,7 +398,7 @@ async function processRestore(jobId, filePath) {
     // Update job
     job.status = 'completed';
     job.resultBuffer = outputBuffer;
-    // Detect actual format from magic bytes
+    // Detect actual format
     if (outputBuffer[0] === 0xFF && outputBuffer[1] === 0xD8) job.contentType = 'image/jpeg';
     else if (outputBuffer[0] === 0x89 && outputBuffer[1] === 0x50) job.contentType = 'image/png';
     else if (outputBuffer[0] === 0x52 && outputBuffer[1] === 0x49 && outputBuffer[8] === 0x57) job.contentType = 'image/webp';
@@ -422,7 +406,6 @@ async function processRestore(jobId, filePath) {
     console.log(`✅ [${jobId}] Restored:`, (outputBuffer.length / 1024).toFixed(0), 'KB, Type:', job.contentType);
   } catch (err) {
     console.error(`❌ [${jobId}] Restore error:`, err.message);
-    console.error(`❌ [${jobId}] Stack:`, (err.stack || '').substring(0, 500));
     job.status = 'failed';
     job.error = err.message;
     try { fs.unlinkSync(filePath); } catch(e){}
@@ -521,5 +504,5 @@ app.listen(PORT, () => {
   console.log(`Clipdrop: ${CLIPDROP_KEY ? '✅' : '❌'}`);
   console.log(`HF: ${HF_TOKEN ? '✅' : '❌'}`);
   console.log(`sharp: ✅`);
-  console.log(`Async restore: ✅`);
+  console.log(`Async restore: ✅ (event: complete fix)`);
 });
