@@ -245,28 +245,25 @@ app.post('/api/cleanup', upload.single('image'), async (req, res) => {
   } catch (err) { console.error('❌ Cleanup error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
 });
 
-// CODEFORMER — RESTORE (with timeout fix + 512px)
+// CODEFORMER — RESTORE (384px FAST)
 app.post('/api/restore', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image' });
 
-    console.log('🎨 Restoring with CodeFormer (512px, fast)...');
+    console.log('🎨 Restoring with CodeFormer (384px, fast)...');
 
-    // Resize to 512px for faster processing
     const smallPath = `uploads/restore-small-${Date.now()}.jpg`;
     await sharp(req.file.path)
-      .resize(512, 512, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 80 })
+      .resize(384, 384, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 70 })
       .toFile(smallPath);
 
     const imageBuffer = fs.readFileSync(smallPath);
     const base64Image = 'data:image/jpeg;base64,' + imageBuffer.toString('base64');
-
     console.log('Uploaded:', (imageBuffer.length / 1024).toFixed(0), 'KB');
 
-    // Step 1: POST
     const postController = new AbortController();
-    const postTimeout = setTimeout(() => postController.abort(), 30000);
+    const postTimeout = setTimeout(() => postController.abort(), 20000);
     const postRes = await fetch('https://sczhou-codeformer.hf.space/gradio_api/call/inference', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -290,13 +287,12 @@ app.post('/api/restore', upload.single('image'), async (req, res) => {
     if (!eventId) throw new Error('No event_id');
     console.log('Event ID:', eventId);
 
-    // Step 2: Poll (max 90 sec)
     let resultUrl = null;
-    for (let i = 0; i < 45; i++) {
-      await new Promise(r => setTimeout(r, 2000));
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1500));
 
       const pollController = new AbortController();
-      const pollTimeout = setTimeout(() => pollController.abort(), 15000);
+      const pollTimeout = setTimeout(() => pollController.abort(), 10000);
 
       try {
         const pollRes = await fetch(`https://sczhou-codeformer.hf.space/gradio_api/call/inference/${eventId}`, {
@@ -333,9 +329,8 @@ app.post('/api/restore', upload.single('image'), async (req, res) => {
 
     if (!resultUrl) throw new Error('CodeFormer timeout');
 
-    // Step 3: Download
     const imgController = new AbortController();
-    const imgTimeout = setTimeout(() => imgController.abort(), 30000);
+    const imgTimeout = setTimeout(() => imgController.abort(), 20000);
     const imgRes = await fetch(resultUrl, { signal: imgController.signal });
     clearTimeout(imgTimeout);
 
