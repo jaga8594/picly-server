@@ -40,10 +40,10 @@ function createJob() {
   jobs.set(jobId, {
     status: 'processing',
     resultBuffer: null,
+    contentType: 'image/png',
     error: null,
     createdAt: Date.now()
   });
-  // Auto-cleanup: 10 min baad job delete
   setTimeout(() => {
     const job = jobs.get(jobId);
     if (job && job.resultBuffer) {
@@ -61,8 +61,8 @@ app.get('/', (req, res) => {
 function getDimensions(ratio) {
   const map = {
     '1:1':  { w: 1024, h: 1024 }, '16:9': { w: 1024, h: 576 }, '9:16': { w: 576, h: 1024 },
-    '4:3':  { w: 1024, h: 768 }, '3:2': { w: 1024, h: 683 }, '4:5': { w: 819, h: 1024 },
-    '3:4':  { w: 768, h: 1024 }, '2:3': { w: 683, h: 1024 }
+    '4:3':  { w: 1024, h: 768 }, '3:2':  { w: 1024, h: 683 }, '4:5':  { w: 819, h: 1024 },
+    '3:4':  { w: 768, h: 1024 }, '2:3':  { w: 683, h: 1024 }
   };
   return map[ratio] || map['1:1'];
 }
@@ -303,6 +303,7 @@ async function processRestore(jobId, filePath) {
 
     if (!postRes.ok) {
       const errText = await postRes.text();
+      console.error(`❌ [${jobId}] POST failed:`, postRes.status, errText.slice(0, 500));
       throw new Error(`CodeFormer POST ${postRes.status}: ${errText.slice(0, 200)}`);
     }
 
@@ -311,9 +312,9 @@ async function processRestore(jobId, filePath) {
     if (!eventId) throw new Error('No event_id');
     console.log(`🆔 [${jobId}] Event ID:`, eventId);
 
-    // Step 2: Poll (max 30 × 1.5 sec = 45 sec)
+    // Step 2: Poll (max 40 × 1.5 sec = 60 sec)
     let resultUrl = null;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 40; i++) {
       await new Promise(r => setTimeout(r, 1500));
 
       const pollController = new AbortController();
@@ -326,23 +327,65 @@ async function processRestore(jobId, filePath) {
         clearTimeout(pollTimeout);
 
         const pollText = await pollRes.text();
+        console.log(`🔍 [${jobId}] Poll ${i + 1} response:`, pollText.slice(0, 400));
 
+        // Check for completed
         if (pollText.includes('process_completed')) {
           for (const line of pollText.split('\n')) {
             if (line.startsWith('data:')) {
               try {
-                const data = JSON.parse(line.replace('data:', '').trim());
-                if (Array.isArray(data) && data[0] && data[0].url) {
-                  resultUrl = data[0].url;
+                const jsonStr = line.replace('data:', '').trim();
+                const data = JSON.parse(jsonStr);
+                
+                // Try multiple formats (Gradio v4 variations)
+                let url = null;
+                
+                // Format 1: Array directly
+                if (Array.isArray(data) && data[0]) {
+                  if (typeof data[0] === 'string') url = data[0];
+                  else if (data[0].url) url = data[0].url;
+                  else if (data[0].path) url = data[0].path;
+                }
+                // Format 2: { data: [...] }
+                else if (data && data.data && Array.isArray(data.data) && data.data[0]) {
+                  if (typeof data.data[0] === 'string') url = data.data[0];
+                  else if (data.data[0].url) url = data.data[0].url;
+                  else if (data.data[0].path) url = data.data[0].path;
+                }
+                // Format 3: { output: { data: [...] } }
+                else if (data && data.output && data.output.data) {
+                  const out = data.output.data;
+                  if (Array.isArray(out) && out[0]) {
+                    if (typeof out[0] === 'string') url = out[0];
+                    else if (out[0].url) url = out[0].url;
+                    else if (out[0].path) url = out[0].path;
+                  }
+                }
+                // Format 4: { output: [...] }
+                else if (data && data.output && Array.isArray(data.output) && data.output[0]) {
+                  if (typeof data.output[0] === 'string') url = data.output[0];
+                  else if (data.output[0].url) url = data.output[0].url;
+                }
+                
+                if (url) {
+                  // If relative URL, prepend HF Space URL
+                  if (url.startsWith('/')) {
+                    url = 'https://sczhou-codeformer.hf.space' + url;
+                  }
+                  resultUrl = url;
+                  console.log(`✅ [${jobId}] Result URL found:`, url);
                   break;
                 }
-              } catch (e) {}
+              } catch (e) {
+                console.log(`⚠️ [${jobId}] Parse error:`, e.message);
+              }
             }
           }
           if (resultUrl) break;
         }
 
         if (pollText.includes('event: error')) {
+          console.error(`❌ [${jobId}] Poll error:`, pollText.slice(0, 500));
           throw new Error('CodeFormer error');
         }
       } catch (e) {
@@ -352,13 +395,16 @@ async function processRestore(jobId, filePath) {
       }
     }
 
-    if (!resultUrl) throw new Error('CodeFormer timeout');
+    if (!resultUrl) throw new Error('CodeFormer timeout — no result URL');
 
-    // Step 3: Download
+    // Step 3: Download result
+    console.log(`📥 [${jobId}] Downloading result from:`, resultUrl);
     const imgController = new AbortController();
     const imgTimeout = setTimeout(() => imgController.abort(), 20000);
     const imgRes = await fetch(resultUrl, { signal: imgController.signal });
     clearTimeout(imgTimeout);
+
+    if (!imgRes.ok) throw new Error('Failed to download result image');
 
     const outputBuffer = Buffer.from(await imgRes.arrayBuffer());
 
@@ -368,9 +414,15 @@ async function processRestore(jobId, filePath) {
     // Update job
     job.status = 'completed';
     job.resultBuffer = outputBuffer;
-    console.log(`✅ [${jobId}] Restored:`, (outputBuffer.length / 1024).toFixed(0), 'KB');
+    // Detect actual format from magic bytes
+    if (outputBuffer[0] === 0xFF && outputBuffer[1] === 0xD8) job.contentType = 'image/jpeg';
+    else if (outputBuffer[0] === 0x89 && outputBuffer[1] === 0x50) job.contentType = 'image/png';
+    else if (outputBuffer[0] === 0x52 && outputBuffer[1] === 0x49 && outputBuffer[8] === 0x57) job.contentType = 'image/webp';
+    else job.contentType = 'image/png';
+    console.log(`✅ [${jobId}] Restored:`, (outputBuffer.length / 1024).toFixed(0), 'KB, Type:', job.contentType);
   } catch (err) {
     console.error(`❌ [${jobId}] Restore error:`, err.message);
+    console.error(`❌ [${jobId}] Stack:`, (err.stack || '').substring(0, 500));
     job.status = 'failed';
     job.error = err.message;
     try { fs.unlinkSync(filePath); } catch(e){}
@@ -380,14 +432,9 @@ async function processRestore(jobId, filePath) {
 app.post('/api/restore', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image' });
-
     const jobId = createJob();
     console.log(`🎯 New job: ${jobId}`);
-
-    // Start background process (no await)
     processRestore(jobId, req.file.path);
-
-    // Immediately respond with job ID
     res.json({ jobId, status: 'processing' });
   } catch (err) {
     console.error('❌ Restore start error:', err.message);
@@ -405,7 +452,10 @@ app.get('/api/restore-result/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'completed') return res.status(400).json({ error: 'Job not completed', status: job.status });
-  res.set('Content-Type', 'image/png');
+  const ct = job.contentType || 'image/png';
+  const ext = ct.includes('jpeg') ? 'jpg' : ct.includes('webp') ? 'webp' : 'png';
+  res.set('Content-Type', ct);
+  res.set('Content-Disposition', 'inline; filename="restored.' + ext + '"');
   res.send(job.resultBuffer);
 });
 
