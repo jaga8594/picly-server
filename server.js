@@ -21,6 +21,7 @@ try {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use(express.static(__dirname, { index: false }));
 
 const CF_ACCOUNT_ID = (process.env.CF_ACCOUNT_ID || '').trim();
 const CF_API_TOKEN = (process.env.CF_API_TOKEN || '').trim();
@@ -250,7 +251,7 @@ app.post('/api/upscale', upload.single('image'), async (req, res) => {
   } catch (err) { console.error('❌ Upscale error:', err.message); try { fs.unlinkSync(req.file.path); } catch(e){} res.status(500).json({ error: err.message }); }
 });
 
-// ==================== CLIPDROP — CLEANUP (Manual Mask) ====================
+// CLIPDROP — CLEANUP
 app.post('/api/cleanup', upload.fields([
   { name: 'image', maxCount: 1 },
   { name: 'mask', maxCount: 1 }
@@ -260,36 +261,27 @@ app.post('/api/cleanup', upload.fields([
       return res.status(400).json({ error: 'Image and mask required' });
     }
     if (!CLIPDROP_KEY) return res.status(500).json({ error: 'Clipdrop key not set' });
-
     const imagePath = req.files.image[0].path;
     const maskPath = req.files.mask[0].path;
-
     const imageBuffer = fs.readFileSync(imagePath);
     const maskBuffer = fs.readFileSync(maskPath);
-
     console.log(`🧹 Cleanup: image ${(imageBuffer.length / 1024).toFixed(0)} KB, mask ${(maskBuffer.length / 1024).toFixed(0)} KB`);
-
     const formData = new FormData();
     formData.append('image_file', new Blob([imageBuffer], { type: 'image/png' }), 'photo.png');
     formData.append('mask_file', new Blob([maskBuffer], { type: 'image/png' }), 'mask.png');
-
     const cdRes = await fetch('https://clipdrop-api.co/cleanup/v1', {
       method: 'POST',
       headers: { 'x-api-key': CLIPDROP_KEY },
       body: formData
     });
-
     if (!cdRes.ok) {
       const errText = await cdRes.text();
       console.error('❌ Clipdrop error:', cdRes.status, errText.slice(0, 300));
       throw new Error(`Clipdrop ${cdRes.status}: ${errText.slice(0, 200)}`);
     }
-
     const outputBuffer = Buffer.from(await cdRes.arrayBuffer());
-
     try { fs.unlinkSync(imagePath); } catch(e){}
     try { fs.unlinkSync(maskPath); } catch(e){}
-
     res.set('Content-Type', 'image/jpeg');
     res.send(outputBuffer);
   } catch (err) {
@@ -300,25 +292,20 @@ app.post('/api/cleanup', upload.fields([
   }
 });
 
-// ==================== CODEFORMER — ASYNC RESTORE ====================
+// CODEFORMER — ASYNC RESTORE
 async function processRestore(jobId, filePath) {
   const job = jobs.get(jobId);
   if (!job) return;
-
   try {
     console.log(`🎨 [${jobId}] Restoring with CodeFormer (384px)...`);
-
     const smallPath = `uploads/restore-small-${Date.now()}.jpg`;
     await sharp(filePath)
       .resize(384, 384, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 70 })
       .toFile(smallPath);
-
     const imageBuffer = fs.readFileSync(smallPath);
     const base64Image = 'data:image/jpeg;base64,' + imageBuffer.toString('base64');
     console.log(`📤 [${jobId}] Uploaded:`, (imageBuffer.length / 1024).toFixed(0), 'KB');
-
-    // Step 1: POST
     const postController = new AbortController();
     const postTimeout = setTimeout(() => postController.abort(), 30000);
     const postRes = await fetch('https://sczhou-codeformer.hf.space/gradio_api/call/inference', {
@@ -333,60 +320,45 @@ async function processRestore(jobId, filePath) {
       signal: postController.signal
     });
     clearTimeout(postTimeout);
-
     if (!postRes.ok) {
       const errText = await postRes.text();
       console.error(`❌ [${jobId}] POST failed:`, postRes.status, errText.slice(0, 500));
       throw new Error(`CodeFormer POST ${postRes.status}: ${errText.slice(0, 200)}`);
     }
-
     const postData = await postRes.json();
     const eventId = postData.event_id;
     if (!eventId) throw new Error('No event_id');
     console.log(`🆔 [${jobId}] Event ID:`, eventId);
-
-    // Step 2: Poll (max 40 × 1.5 sec = 60 sec)
     let resultUrl = null;
     for (let i = 0; i < 40; i++) {
       await new Promise(r => setTimeout(r, 1500));
-
       const pollController = new AbortController();
       const pollTimeout = setTimeout(() => pollController.abort(), 10000);
-
       try {
         const pollRes = await fetch(`https://sczhou-codeformer.hf.space/gradio_api/call/inference/${eventId}`, {
           signal: pollController.signal
         });
         clearTimeout(pollTimeout);
-
         const pollText = await pollRes.text();
         console.log(`🔍 [${jobId}] Poll ${i + 1}:`, pollText.slice(0, 300));
-
-        // ✅ FIX: 'event: complete' check karo
         if (pollText.includes('event: complete') || pollText.includes('process_completed')) {
           for (const line of pollText.split('\n')) {
             if (line.startsWith('data:')) {
               try {
                 const jsonStr = line.replace('data:', '').trim();
                 const data = JSON.parse(jsonStr);
-                
                 let url = null;
-                
-                // Format: [{url: "...", path: "..."}]
                 if (Array.isArray(data) && data[0]) {
                   const first = data[0];
                   if (typeof first === 'string') url = first;
                   else if (first.url) url = first.url;
                   else if (first.path) url = first.path;
-                }
-                // Format: { data: [...] }
-                else if (data && data.data && Array.isArray(data.data) && data.data[0]) {
+                } else if (data && data.data && Array.isArray(data.data) && data.data[0]) {
                   const first = data.data[0];
                   if (typeof first === 'string') url = first;
                   else if (first.url) url = first.url;
                   else if (first.path) url = first.path;
                 }
-                
                 if (url) {
                   if (url.startsWith('/')) url = 'https://sczhou-codeformer.hf.space' + url;
                   resultUrl = url;
@@ -400,7 +372,6 @@ async function processRestore(jobId, filePath) {
           }
           if (resultUrl) break;
         }
-
         if (pollText.includes('event: error')) {
           console.error(`❌ [${jobId}] Poll error:`, pollText.slice(0, 500));
           throw new Error('CodeFormer error');
@@ -411,27 +382,18 @@ async function processRestore(jobId, filePath) {
         throw e;
       }
     }
-
     if (!resultUrl) throw new Error('CodeFormer timeout — no result URL');
-
-    // Step 3: Download result
     console.log(`📥 [${jobId}] Downloading result from:`, resultUrl);
     const imgController = new AbortController();
     const imgTimeout = setTimeout(() => imgController.abort(), 20000);
     const imgRes = await fetch(resultUrl, { signal: imgController.signal });
     clearTimeout(imgTimeout);
-
     if (!imgRes.ok) throw new Error('Failed to download result image');
-
     const outputBuffer = Buffer.from(await imgRes.arrayBuffer());
-
     try { fs.unlinkSync(filePath); } catch(e){}
     try { fs.unlinkSync(smallPath); } catch(e){}
-
-    // Update job
     job.status = 'completed';
     job.resultBuffer = outputBuffer;
-    // Detect actual format
     if (outputBuffer[0] === 0xFF && outputBuffer[1] === 0xD8) job.contentType = 'image/jpeg';
     else if (outputBuffer[0] === 0x89 && outputBuffer[1] === 0x50) job.contentType = 'image/png';
     else if (outputBuffer[0] === 0x52 && outputBuffer[1] === 0x49 && outputBuffer[8] === 0x57) job.contentType = 'image/webp';
